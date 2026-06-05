@@ -29,6 +29,8 @@ shutdown-timeout = The system will shut down automatically
 suspend = Suspend
 user = User
 
+fingerprint-available = Or swipe your fingerprint to unlock.
+
 # Authentication errors
 auth-error-default = Authentication failed. Please try again.
 auth-error-credentials = Incorrect password. Please check your keyboard layout and try again.

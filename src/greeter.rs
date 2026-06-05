@@ -791,7 +791,7 @@ impl App {
                                 // Empty transparent box for users without icons
                                 column = column.push(
                                     widget::container(
-                                        widget::space::horizontal().width(Length::Fixed(78.0)),
+                                        widget::icon::from_name("avatar-default").size(78),
                                     )
                                     .padding(0.0)
                                     .width(Length::Fill)
@@ -1148,6 +1148,7 @@ impl cosmic::Application for App {
             .or_else(|| session_names.first().cloned())
             .unwrap_or_default();
         let data_idx = flags.user_datas.iter().position(|d| d.name == username);
+        let entering_name = username.is_empty();
         let selected_username = NameIndexPair { username, data_idx };
         let accessibility = Accessibility {
             helper: cosmic_settings_daemon_config::greeter::GreeterAccessibilityState::config()
@@ -1167,7 +1168,7 @@ impl cosmic::Application for App {
             dialog_page_opt: None,
             dropdown_opt: None,
             heartbeat_handle: None,
-            entering_name: false,
+            entering_name,
             accessibility,
             theme_builder: Default::default(),
             randr_list: None,
@@ -1329,10 +1330,12 @@ impl cosmic::Application for App {
             Message::Socket(socket_state) => {
                 self.socket_state = socket_state;
                 if let SocketState::Open = &self.socket_state {
-                    // When socket is opened, send create session
-                    self.send_request(Request::CreateSession {
-                        username: self.selected_username.username.clone(),
-                    });
+                    if !self.selected_username.username.is_empty() {
+                        // When socket is opened and username is set, send create session
+                        self.send_request(Request::CreateSession {
+                            username: self.selected_username.username.clone(),
+                        });
+                    }
                 }
             }
             Message::Reload(new) => {
@@ -1362,6 +1365,9 @@ impl cosmic::Application for App {
                 }
             }
             Message::Username(username) => {
+                if username.trim().is_empty() {
+                    return Task::none();
+                }
                 if self.dropdown_opt == Some(Dropdown::User) {
                     self.dropdown_opt = None;
                 }

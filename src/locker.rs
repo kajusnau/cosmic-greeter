@@ -36,6 +36,110 @@ use wayland_client::protocol::wl_output::WlOutput;
 use crate::common::{self, Common, DEFAULT_MENU_ITEM_HEIGHT};
 use crate::fl;
 
+mod fprintd {
+    use zbus::proxy;
+
+    #[proxy(
+        interface = "net.reactivated.Fprint.Manager",
+        default_service = "net.reactivated.Fprint",
+        default_path = "/net/reactivated/Fprint/Manager"
+    )]
+    pub trait Manager {
+        fn get_default_device(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    }
+
+    #[proxy(
+        interface = "net.reactivated.Fprint.Device",
+        default_service = "net.reactivated.Fprint"
+    )]
+    pub trait Device {
+        fn list_enrolled_fingers(&self, username: &str) -> zbus::Result<Vec<String>>;
+        fn claim(&self, username: &str) -> zbus::Result<()>;
+        fn verify_start(&self, finger: &str) -> zbus::Result<()>;
+        fn verify_stop(&self) -> zbus::Result<()>;
+        fn release(&self) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn verify_status(&self, result: &str, done: bool) -> zbus::Result<()>;
+    }
+}
+
+async fn fingerprint_enrolled(username: &str) -> bool {
+    let result: zbus::Result<bool> = async {
+        let conn = zbus::Connection::system().await?;
+        let manager = fprintd::ManagerProxy::new(&conn).await?;
+        let device_path = manager.get_default_device().await?;
+        let device = fprintd::DeviceProxy::builder(&conn)
+            .path(device_path)?
+            .build()
+            .await?;
+        let fingers = device.list_enrolled_fingers(username).await.unwrap_or_default();
+        Ok(!fingers.is_empty())
+    }
+    .await;
+    result.unwrap_or(false)
+}
+
+async fn fingerprint_verify(username: &str) -> bool {
+    match try_fingerprint_verify(username).await {
+        Ok(matched) => matched,
+        Err(err) => {
+            tracing::debug!("fprintd: not available: {}", err);
+            false
+        }
+    }
+}
+
+async fn try_fingerprint_verify(username: &str) -> zbus::Result<bool> {
+    use futures_util::StreamExt;
+
+    let conn = zbus::Connection::system().await?;
+    let manager = fprintd::ManagerProxy::new(&conn).await?;
+    let device_path = manager.get_default_device().await?;
+
+    let device = fprintd::DeviceProxy::builder(&conn)
+        .path(device_path)?
+        .build()
+        .await?;
+
+    // fprintd returns an error (not an empty list) when no fingers are enrolled
+    let fingers = device
+        .list_enrolled_fingers(username)
+        .await
+        .unwrap_or_default();
+    if fingers.is_empty() {
+        return Ok(false);
+    }
+
+    device.claim(username).await?;
+
+    // Subscribe before starting verification to avoid a race with the signal
+    let mut status_stream = device.receive_verify_status().await?;
+    if let Err(err) = device.verify_start("any").await {
+        let _ = device.release().await;
+        return Err(err);
+    }
+
+    let mut matched = false;
+    while let Some(signal) = status_stream.next().await {
+        if let Ok(args) = signal.args() {
+            tracing::info!("fprintd: result={} done={}", args.result(), args.done());
+            if *args.result() == "verify-match" {
+                matched = true;
+                break;
+            }
+            if *args.done() {
+                break;
+            }
+        }
+    }
+
+    let _ = device.verify_stop().await;
+    let _ = device.release().await;
+
+    Ok(matched)
+}
+
 fn lockfile_opt() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir()?;
     let session_id = env::var("XDG_SESSION_ID").ok()?;
@@ -272,6 +376,7 @@ pub enum Message {
     Suspend,
     TimeAppletConfig(TimeAppletConfig),
     Error(String),
+    FingerprintAvailable(bool),
     Lock,
     Unlock,
     SpinnerTick,
@@ -312,6 +417,7 @@ pub struct App {
     inhibit_opt: Option<Arc<OwnedFd>>,
     value_tx_opt: Option<mpsc::Sender<String>>,
     authenticating: bool,
+    fingerprint_available: bool,
     spinner_rotation: f32,
     spinner_handle: Option<cosmic::iced::task::Handle>,
 }
@@ -491,7 +597,7 @@ impl App {
             } else {
                 // Empty transparent box for users without icons
                 column = column.push(
-                    widget::container(widget::space::horizontal().width(Length::Fixed(78.0)))
+                    widget::container(widget::icon::from_name("avatar-default").size(78))
                         .padding(0.0)
                         .width(Length::Fill)
                         .height(Length::Fixed(78.0))
@@ -551,6 +657,12 @@ impl App {
                             column = column.push(widget::text(fl!("caps-lock")));
                         } else if self.common.error_opt.is_none() {
                             column = column.push(widget::text(""));
+                        }
+                        if self.fingerprint_available
+                            && !self.authenticating
+                            && self.common.error_opt.is_none()
+                        {
+                            column = column.push(widget::text(fl!("fingerprint-available")));
                         }
                     }
                     None => {
@@ -675,6 +787,7 @@ impl cosmic::Application for App {
             inhibit_opt: None,
             value_tx_opt: None,
             authenticating: false,
+            fingerprint_available: false,
             spinner_rotation: 0.0,
             spinner_handle: None,
         };
@@ -885,6 +998,9 @@ impl cosmic::Application for App {
                                     }
                                 };
 
+                                // Clone before pam_future captures msg_tx mutably
+                                let fp_tx_clone = msg_tx.clone();
+
                                 let pam_future = async {
                                     loop {
                                         let (value_tx, value_rx) = mpsc::channel(16);
@@ -928,9 +1044,59 @@ impl cosmic::Application for App {
                                     }
                                 };
 
+                                let fingerprint_future = {
+                                    let fp_username = username.clone();
+                                    let mut fp_tx = fp_tx_clone;
+                                    async move {
+                                        let enrolled =
+                                            fingerprint_enrolled(&fp_username).await;
+                                        fp_tx
+                                            .send(cosmic::Action::App(
+                                                Message::FingerprintAvailable(enrolled),
+                                            ))
+                                            .await
+                                            .ok();
+                                        if enrolled {
+                                            // Retry loop: if the scan times out (fprintd has
+                                            // a built-in timeout per attempt) or the device
+                                            // was temporarily claimed by another client, keep
+                                            // trying so the scanner stays active continuously.
+                                            loop {
+                                                if fingerprint_verify(&fp_username).await {
+                                                    tracing::info!(
+                                                        "fingerprint authentication succeeded"
+                                                    );
+                                                    fp_tx
+                                                        .send(cosmic::Action::App(
+                                                            Message::Unlock,
+                                                        ))
+                                                        .await
+                                                        .ok();
+                                                    return;
+                                                }
+                                                // Brief pause before retry to avoid hammering
+                                                // fprintd if the device is busy.
+                                                tokio::time::sleep(
+                                                    Duration::from_millis(500),
+                                                )
+                                                .await;
+                                            }
+                                        } else {
+                                            // No fingerprint enrolled — hang and let the PAM
+                                            // password loop handle auth.
+                                            futures::future::pending::<()>().await;
+                                        }
+                                    }
+                                };
+
                                 futures::pin_mut!(heartbeat_future);
                                 futures::pin_mut!(pam_future);
-                                futures::future::select(heartbeat_future, pam_future).await;
+                                futures::pin_mut!(fingerprint_future);
+                                tokio::select! {
+                                    _ = heartbeat_future => {},
+                                    _ = pam_future => {},
+                                    _ = fingerprint_future => {},
+                                }
                             },
                         ))
                         .abortable();
@@ -1095,6 +1261,9 @@ impl cosmic::Application for App {
             Message::TimeAppletConfig(config) => {
                 self.flags.user_data.time_applet_config = config;
             }
+            Message::FingerprintAvailable(available) => {
+                self.fingerprint_available = available;
+            }
             Message::Error(error) => {
                 self.common.error_opt = Some(error);
                 self.authenticating = false;
@@ -1119,6 +1288,7 @@ impl cosmic::Application for App {
                     self.value_tx_opt = None;
                     // Reset authenticating state
                     self.authenticating = false;
+                    self.fingerprint_available = false;
                     if let Some(handle) = self.spinner_handle.take() {
                         handle.abort();
                     }
@@ -1142,7 +1312,7 @@ impl cosmic::Application for App {
             Message::Unlock => {
                 match self.state {
                     State::Locked { .. } => {
-                        tracing::info!("sessing unlocking");
+                        tracing::info!("session unlocking");
                         self.state = State::Unlocking;
                         // Clear errors
                         self.common.error_opt = None;
@@ -1150,6 +1320,7 @@ impl cosmic::Application for App {
                         self.value_tx_opt = None;
                         // Stop authenticating
                         self.authenticating = false;
+                        self.fingerprint_available = false;
 
                         // Stop spinner animation
                         if let Some(handle) = self.spinner_handle.take() {
